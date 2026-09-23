@@ -61,6 +61,7 @@ pub enum WriteBatchRecord<T: AsRef<[u8]>> {
 
 impl LsmStorageState {
     fn create(options: &LsmStorageOptions) -> Self {
+        // 根据不同的压缩选项初始化不同的参数
         let levels = match &options.compaction_options {
             CompactionOptions::Leveled(LeveledCompactionOptions { max_levels, .. })
             | CompactionOptions::Simple(SimpleLeveledCompactionOptions { max_levels, .. }) => (1
@@ -85,6 +86,7 @@ pub struct LsmStorageOptions {
     // Block size in bytes
     pub block_size: usize,
     // SST size in bytes, also the approximate memtable capacity limit
+    // LsmStorageOptions::target_sst_size 既代表了目标 SST 的容量大小，也大致反映了内存表的容量上限
     pub target_sst_size: usize,
     // Maximum number of memtables in memory, flush to L0 when exceeding this limit
     pub num_memtable_limit: usize,
@@ -135,7 +137,10 @@ pub enum CompactionFilter {
 
 /// The storage interface of the LSM tree.
 pub(crate) struct LsmStorageInner {
+    // state.write() 保护状态快照的替换。冻结时要更换 memtable、把旧表加入 imm_memtables
+    // memtable 的get和put操作都只需要获取读锁，state.read()
     pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,
+    //  state_lock 保护一次结构变更从判断到完成的流程
     pub(crate) state_lock: Mutex<()>,
     path: PathBuf,
     pub(crate) block_cache: Arc<BlockCache>,
@@ -297,8 +302,30 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        // 先复制一份 Arc 快照，让读锁很快释放，再从快照中的 MemTable 查找
+        let guard = self.state.read();
+        let snapshot = guard.clone();
+        drop(guard);
+
+        if let Some(value) = snapshot.memtable.get(key) {
+            if value.is_empty() {
+                return Ok(None); // 空value表示之前删除过了，返回None
+            } else {
+                return Ok(Some(value));
+            }
+        }
+
+        for table in snapshot.imm_memtables.iter() {
+            if let Some(value) = table.get(key) {
+                if value.is_empty() {
+                    return Ok(None);
+                } else {
+                    return Ok(Some(value));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -307,13 +334,32 @@ impl LsmStorageInner {
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let reached_limit = {
+            let read_guard = self.state.read();
+            read_guard.memtable.put(key, value)?;
+            read_guard.memtable.approximate_size() >= self.options.target_sst_size
+        }; // 读锁在这里解锁
+
+        if reached_limit {
+            // 尝试拿到state_lock锁
+            let guard = self.state_lock.lock();
+            let still_full = {
+                // 重新获得state读锁，判断是否已满
+                let read_guard = self.state.read();
+                read_guard.memtable.approximate_size() >= self.options.target_sst_size
+            }; // 这里释放读锁
+
+            if still_full {
+                return self.force_freeze_memtable(&guard);
+            }
+        }
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.put(key, &[])
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -337,8 +383,23 @@ impl LsmStorageInner {
     }
 
     /// Force freeze the current memtable to an immutable memtable
+    /// 写者会先获取state的写锁，然后复制其底层结构，对复制后的内容进行必要的修改，
+    /// 再将其封装进一个新的容器中，最后用这个新的容器替换掉原来的内容。
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        // _state_lock_observer没有被使用
+        // 它的作用是借助 Rust 类型系统表达，调用这个函数的人必须已经持有 state_lock
+
+        let id = self.next_sst_id();
+        // 这里创建一个新的memtable，原子地替换旧的。创建wal是耗时操作
+        let memtable = Arc::new(MemTable::create(id));
+
+        let mut write_guard = self.state.write();
+        let mut snapshot = write_guard.as_ref().clone();
+        let old_memtable = std::mem::replace(&mut snapshot.memtable, memtable);
+        snapshot.imm_memtables.insert(0, old_memtable);
+        *write_guard = Arc::new(snapshot);
+
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
