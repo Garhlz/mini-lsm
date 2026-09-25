@@ -25,13 +25,19 @@ use crate::{
 /// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
 type LsmIteratorInner = MergeIterator<MemTableIterator>;
 
+// LsmIterator 代表存储引擎的内部迭代器
 pub struct LsmIterator {
     inner: LsmIteratorInner,
 }
 
 impl LsmIterator {
     pub(crate) fn new(iter: LsmIteratorInner) -> Result<Self> {
-        Ok(Self { inner: iter })
+        let mut lsm_iter = Self { inner: iter };
+        // 跳过起点处的墓碑
+        while lsm_iter.inner.is_valid() && lsm_iter.inner.value().is_empty() {
+            lsm_iter.inner.next()?;
+        }
+        Ok(lsm_iter)
     }
 }
 
@@ -39,19 +45,27 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.inner.is_valid()
     }
 
     fn key(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.key().raw_ref()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if self.inner.is_valid() {
+            self.inner.next()?;
+        }
+
+        // 当前项是删除标记
+        while self.inner.is_valid() && self.inner.value().is_empty() {
+            self.inner.next()?;
+        }
+        Ok(())
     }
 }
 
@@ -79,18 +93,34 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         Self: 'a;
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        if self.has_errored {
+            false
+        } else {
+            self.iter.is_valid()
+        }
     }
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        self.iter.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.iter.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        // 如果发生过错误，next总是报错
+        if self.has_errored {
+            return Err(anyhow::anyhow!("迭代器此前已发生错误"));
+        }
+        // 如果已经无效，next不做任何事情
+        if !self.is_valid() {
+            return Ok(());
+        }
+        let result = self.iter.next();
+        if result.is_err() {
+            self.has_errored = true;
+        }
+        result
     }
 }

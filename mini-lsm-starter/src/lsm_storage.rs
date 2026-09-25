@@ -30,6 +30,7 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::merge_iterator::MergeIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
@@ -390,7 +391,7 @@ impl LsmStorageInner {
         // 它的作用是借助 Rust 类型系统表达，调用这个函数的人必须已经持有 state_lock
 
         let id = self.next_sst_id();
-        // 这里创建一个新的memtable，原子地替换旧的。创建wal是耗时操作
+        // 这里创建一个新的memtable，原子地替换旧的。创建memtable的wal是耗时操作
         let memtable = Arc::new(MemTable::create(id));
 
         let mut write_guard = self.state.write();
@@ -415,9 +416,18 @@ impl LsmStorageInner {
     /// Create an iterator over a range of keys.
     pub fn scan(
         &self,
-        _lower: Bound<&[u8]>,
-        _upper: Bound<&[u8]>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        unimplemented!()
+        let guard = self.state.read();
+        let memtable_iter = guard.memtable.scan(lower, upper);
+        let mut iter_vec = vec![Box::new(memtable_iter)];
+        for table in guard.imm_memtables.iter() {
+            let iter = table.scan(lower, upper);
+            iter_vec.push(Box::new(iter));
+        }
+        let merge_iter = MergeIterator::create(iter_vec);
+        let lsm_iter = LsmIterator::new(merge_iter)?;
+        Ok(FusedIterator::new(lsm_iter))
     }
 }
