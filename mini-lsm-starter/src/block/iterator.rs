@@ -37,55 +37,96 @@ pub struct BlockIterator {
 
 impl BlockIterator {
     fn new(block: Arc<Block>) -> Self {
+        let first_key = if block.offsets.is_empty() {
+            KeyVec::new()
+        } else {
+            block.get_key_at(0)
+        };
         Self {
             block,
             key: KeyVec::new(),
             value_range: (0, 0),
             idx: 0,
-            first_key: KeyVec::new(),
+            first_key,
         }
     }
 
     /// Creates a block iterator and seek to the first entry.
     pub fn create_and_seek_to_first(block: Arc<Block>) -> Self {
-        unimplemented!()
+        let mut iter = Self::new(block);
+        iter.seek_to_first();
+        iter
     }
 
     /// Creates a block iterator and seek to the first key that >= `key`.
     pub fn create_and_seek_to_key(block: Arc<Block>, key: KeySlice) -> Self {
-        unimplemented!()
+        let mut iter = Self::new(block);
+        iter.seek_to_key(key);
+        iter
     }
 
     /// Returns the key of the current entry.
     pub fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        self.key.as_key_slice()
     }
 
     /// Returns the value of the current entry.
     pub fn value(&self) -> &[u8] {
-        unimplemented!()
+        &self.block.data[self.value_range.0..self.value_range.1]
     }
 
     /// Returns true if the iterator is valid.
     /// Note: You may want to make use of `key`
     pub fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.key.is_empty()
     }
 
     /// Seeks to the first key in the block.
     pub fn seek_to_first(&mut self) {
-        unimplemented!()
+        if self.block.offsets.is_empty() {
+            self.set_invalid();
+            return;
+        }
+        let (key, value_range) = self.block.get_kv_at(0);
+
+        self.key = key;
+        self.value_range = value_range;
+        self.idx = 0;
     }
 
     /// Move to the next key in the block.
     pub fn next(&mut self) {
-        unimplemented!()
+        let idx = self.idx + 1;
+        if idx >= self.block.offsets.len() {
+            self.set_invalid();
+            return;
+        }
+        let (key, value_range) = self.block.get_kv_at(idx);
+
+        self.key = key;
+        self.value_range = value_range;
+        self.idx = idx;
     }
 
     /// Seek to the first key that >= `key`.
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
-        unimplemented!()
+        let idx = self.block.binary_search(key);
+        if idx >= self.block.offsets.len() {
+            self.set_invalid();
+            return;
+        }
+
+        let (key, value_range) = self.block.get_kv_at(idx);
+        self.key = key;
+        self.value_range = value_range;
+        self.idx = idx;
+    }
+
+    fn set_invalid(&mut self) {
+        self.key = KeyVec::new();
+        self.idx = self.block.offsets.len(); // 超过范围的无效值
+        self.value_range = (0, 0);
     }
 }
