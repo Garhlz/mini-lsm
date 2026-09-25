@@ -32,24 +32,58 @@ pub struct SsTableIterator {
 impl SsTableIterator {
     /// Create a new iterator and seek to the first key-value pair in the first data block.
     pub fn create_and_seek_to_first(table: Arc<SsTable>) -> Result<Self> {
-        unimplemented!()
+        let block = table.read_block_cached(0)?;
+        let iter = BlockIterator::create_and_seek_to_first(block);
+        Ok(Self {
+            table,
+            blk_iter: iter,
+            blk_idx: 0,
+        })
     }
 
     /// Seek to the first key-value pair in the first data block.
     pub fn seek_to_first(&mut self) -> Result<()> {
-        unimplemented!()
+        let block = self.table.read_block_cached(0)?;
+        let iter = BlockIterator::create_and_seek_to_first(block);
+        self.blk_iter = iter;
+        self.blk_idx = 0;
+        Ok(())
     }
 
     /// Create a new iterator and seek to the first key-value pair which >= `key`.
     pub fn create_and_seek_to_key(table: Arc<SsTable>, key: KeySlice) -> Result<Self> {
-        unimplemented!()
+        let mut iter = Self::create_and_seek_to_first(table)?;
+        iter.seek_to_key(key)?;
+        Ok(iter)
     }
 
     /// Seek to the first key-value pair which >= `key`.
     /// Note: You probably want to review the handout for detailed explanation when implementing
     /// this function.
     pub fn seek_to_key(&mut self, key: KeySlice) -> Result<()> {
-        unimplemented!()
+        let index = self.table.binary_search(key);
+        if index == self.table.block_meta.len() {
+            // 找不到比当前key大的，正常返回无效的iter
+            let len = self.table.block_meta.len();
+            let block = self.table.read_block_cached(len - 1)?;
+            let block_iter = BlockIterator::create_and_seek_to_key(block, key);
+            self.blk_idx = len - 1;
+            self.blk_iter = block_iter;
+            Ok(())
+        } else if self.table.block_meta[index].first_key.as_key_slice() > key {
+            let block = self.table.read_block_cached(index)?;
+            // 要寻找的key < 该block的first key，所以满足条件的key就是当前block的first key
+            let block_iter = BlockIterator::create_and_seek_to_first(block);
+            self.blk_idx = index;
+            self.blk_iter = block_iter;
+            Ok(())
+        } else {
+            let block = self.table.read_block_cached(index)?;
+            let block_iter = BlockIterator::create_and_seek_to_key(block, key);
+            self.blk_idx = index;
+            self.blk_iter = block_iter;
+            Ok(())
+        }
     }
 }
 
@@ -58,22 +92,35 @@ impl StorageIterator for SsTableIterator {
 
     /// Return the `key` that's held by the underlying block iterator.
     fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        self.blk_iter.key()
     }
 
     /// Return the `value` that's held by the underlying block iterator.
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.blk_iter.value()
     }
 
     /// Return whether the current block iterator is valid or not.
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.blk_iter.is_valid()
     }
 
     /// Move to the next `key` in the block.
     /// Note: You may want to check if the current block iterator is valid after the move.
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.blk_iter.next();
+        if !self.blk_iter.is_valid() {
+            // block iter移动之后失效了
+
+            if self.blk_idx + 1 >= self.table.block_meta.len() {
+                // 已经是最后一个block，正常结束
+                return Ok(());
+            }
+            let block = self.table.read_block_cached(self.blk_idx + 1)?;
+            let iter = BlockIterator::create_and_seek_to_first(block);
+            self.blk_iter = iter;
+            self.blk_idx += 1;
+        }
+        Ok(())
     }
 }
