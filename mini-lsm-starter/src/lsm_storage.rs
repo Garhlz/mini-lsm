@@ -30,12 +30,15 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -304,27 +307,53 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        // 先复制一份 Arc 快照，让读锁很快释放，再从快照中的 MemTable 查找
-        let guard = self.state.read();
-        let snapshot = guard.clone();
-        drop(guard);
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
 
-        if let Some(value) = snapshot.memtable.get(key) {
+        // 先找内存中当前使用的最新的memtable
+        let value_opt = snapshot.memtable.get(key);
+        if let Some(value) = value_opt {
             if value.is_empty() {
-                return Ok(None); // 空value表示之前删除过了，返回None
+                return Ok(None);
             } else {
                 return Ok(Some(value));
             }
         }
 
-        for table in snapshot.imm_memtables.iter() {
-            if let Some(value) = table.get(key) {
+        // 然后找内存中的静态memtable
+        for memtable in snapshot.imm_memtables.iter() {
+            let value_opt = memtable.get(key);
+            if let Some(value) = value_opt {
                 if value.is_empty() {
                     return Ok(None);
                 } else {
                     return Ok(Some(value));
                 }
             }
+        }
+
+        // 然后按照先后顺序从磁盘中寻找
+        for index in snapshot.l0_sstables.iter() {
+            let sst = snapshot.sstables.get(index).unwrap();
+            let iter = SsTableIterator::create_and_seek_to_key(
+                Arc::clone(sst),
+                KeySlice::from_slice(key),
+            )?;
+            if !iter.is_valid() {
+                // 找不到>=key的东西
+                continue;
+            }
+            if iter.key() == KeySlice::from_slice(key) {
+                let value = iter.value();
+                if value.is_empty() {
+                    return Ok(None);
+                } else {
+                    return Ok(Some(Bytes::copy_from_slice(value)));
+                }
+            }
+            // 否则就是没有找到
         }
         Ok(None)
     }
@@ -419,15 +448,65 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        let guard = self.state.read();
-        let memtable_iter = guard.memtable.scan(lower, upper);
-        let mut iter_vec = vec![Box::new(memtable_iter)];
-        for table in guard.imm_memtables.iter() {
+        // 获取快照，在读锁外进行io操作
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+
+        let memtable_iter = snapshot.memtable.scan(lower, upper);
+        let mut mem_iter_vec = vec![Box::new(memtable_iter)];
+        for table in snapshot.imm_memtables.iter() {
             let iter = table.scan(lower, upper);
-            iter_vec.push(Box::new(iter));
+            mem_iter_vec.push(Box::new(iter));
         }
-        let merge_iter = MergeIterator::create(iter_vec);
-        let lsm_iter = LsmIterator::new(merge_iter)?;
+        let mem_merge_iter = MergeIterator::create(mem_iter_vec);
+
+        let start = map_bound(lower);
+        let end = map_bound(upper);
+        let mut sst_iter_vec = Vec::with_capacity(snapshot.sstables.len());
+
+        // 处理sst iters的lower bound问题
+        match start {
+            Bound::Included(start) => {
+                for &index in snapshot.l0_sstables.iter() {
+                    // 按照存储的顺序进行遍历
+                    let sst = snapshot.sstables.get(&index).unwrap();
+                    let iter = SsTableIterator::create_and_seek_to_key(
+                        Arc::clone(sst),
+                        KeySlice::from_slice(start.as_ref()),
+                    )?;
+                    sst_iter_vec.push(Box::new(iter));
+                }
+            }
+            Bound::Excluded(start) => {
+                for &index in snapshot.l0_sstables.iter() {
+                    // 按照存储的顺序进行遍历
+                    let sst = snapshot.sstables.get(&index).unwrap();
+                    let start_key = KeySlice::from_slice(start.as_ref());
+                    let mut iter =
+                        SsTableIterator::create_and_seek_to_key(Arc::clone(sst), start_key)?;
+                    if iter.is_valid() && iter.key() == start_key {
+                        iter.next()?;
+                    }
+                    sst_iter_vec.push(Box::new(iter));
+                }
+            }
+            Bound::Unbounded => {
+                for &index in snapshot.l0_sstables.iter() {
+                    // 按照存储的顺序进行遍历
+                    let sst = snapshot.sstables.get(&index).unwrap();
+                    let iter = SsTableIterator::create_and_seek_to_first(Arc::clone(sst))?;
+                    sst_iter_vec.push(Box::new(iter));
+                }
+            }
+        }
+
+        let sst_merge_iter = MergeIterator::create(sst_iter_vec);
+
+        let two_iter = TwoMergeIterator::create(mem_merge_iter, sst_merge_iter)?;
+
+        let lsm_iter = LsmIterator::new(two_iter, end)?;
         Ok(FusedIterator::new(lsm_iter))
     }
 }
