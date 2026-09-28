@@ -160,7 +160,17 @@ impl LsmStorageInner {
         Ok(None)
     }
 
+    // 定期检查是否需要flush immu_memtable
     fn trigger_flush(&self) -> Result<()> {
+        let immu_memtable_count = {
+            let guard = self.state.read();
+            guard.imm_memtables.len()
+        };
+        // 静态memtable数量达到阈值
+        // 刷盘
+        if immu_memtable_count >= self.options.num_memtable_limit {
+            self.force_flush_next_imm_memtable()?;
+        }
         Ok(())
     }
 
@@ -173,9 +183,11 @@ impl LsmStorageInner {
             let ticker = crossbeam_channel::tick(Duration::from_millis(50));
             loop {
                 crossbeam_channel::select! {
+                    // 在后台线程中，定时检查是否需要flush
                     recv(ticker) -> _ => if let Err(e) = this.trigger_flush() {
                         eprintln!("flush failed: {}", e);
                     },
+                    // channel收到消息之后，线程退出
                     recv(rx) -> _ => return
                 }
             }

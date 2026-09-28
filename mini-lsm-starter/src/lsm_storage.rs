@@ -38,7 +38,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 use rayon::prelude::*;
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
@@ -179,7 +179,24 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        // 先通知两个后台线程退出。
+        self.flush_notifier.send(()).ok();
+        self.compaction_notifier.send(()).ok();
+
+        // 取出句柄后释放 Mutex，再等待线程结束。
+        let flush_handle = self.flush_thread.lock().take();
+        let compaction_handle = self.compaction_thread.lock().take();
+
+        let flush_result = flush_handle.map(|handle| handle.join());
+        let compaction_result = compaction_handle.map(|handle| handle.join());
+
+        if matches!(flush_result, Some(Err(_))) {
+            return Err(anyhow::anyhow!("flush thread panicked"));
+        }
+        if matches!(compaction_result, Some(Err(_))) {
+            return Err(anyhow::anyhow!("compaction thread panicked"));
+        }
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -281,6 +298,9 @@ impl LsmStorageInner {
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
 
+        // 创建缺失的目录及其父目录，目录已经存在也可以正常返回
+        std::fs::create_dir_all(path)?;
+
         let storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
             state_lock: Mutex::new(()),
@@ -338,6 +358,10 @@ impl LsmStorageInner {
         // 然后按照先后顺序从磁盘中寻找
         for index in snapshot.l0_sstables.iter() {
             let sst = snapshot.sstables.get(index).unwrap();
+            // 只能查找当前sst范围内的值
+            if key < sst.first_key().raw_ref() || key > sst.last_key().raw_ref() {
+                continue;
+            }
             let iter = SsTableIterator::create_and_seek_to_key(
                 Arc::clone(sst),
                 KeySlice::from_slice(key),
@@ -435,7 +459,41 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        // 在state lock锁中操作
+        let state_lock_guard = self.state_lock.lock();
+        // 获取最旧imm memtable的快照
+        let memtable_snapshot = {
+            let guard = self.state.read();
+            if guard.imm_memtables.is_empty() {
+                return Ok(());
+            }
+            Arc::clone(guard.imm_memtables.last().unwrap())
+        };
+
+        // 在锁外构建sst
+        let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+        memtable_snapshot.flush(&mut sst_builder)?;
+
+        // 使用的是最旧memtable的id
+        let id = memtable_snapshot.id();
+        let sst = sst_builder.build(id, Some(self.block_cache.clone()), self.path_of_sst(id))?;
+
+        // 获取state写锁
+        let mut guard = self.state.write();
+        let mut state = guard.as_ref().clone();
+
+        if state.imm_memtables[state.imm_memtables.len() - 1].id() != memtable_snapshot.id() {
+            // 状态已经被修改，本次任务失败结束
+            return Err(anyhow::anyhow!("已持有state lock, 状态已被修改"));
+        }
+
+        state.imm_memtables.pop();
+        state.l0_sstables.insert(0, id);
+        state.sstables.insert(id, Arc::new(sst));
+
+        // 发布新的 Arc<LsmStorageState>
+        *guard = Arc::new(state);
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
@@ -469,6 +527,16 @@ impl LsmStorageInner {
         let sst_iter_vec = snapshot
             .l0_sstables
             .par_iter()
+            .filter(|&&id| {
+                let sst = snapshot.sstables.get(&id).unwrap();
+                // 当前sst和scan的范围有所重叠
+                range_overlap(
+                    sst.first_key().raw_ref(),
+                    sst.last_key().raw_ref(),
+                    lower,
+                    upper,
+                )
+            })
             .map(|&id| -> Result<Box<SsTableIterator>> {
                 // 这里从 Vec 的 par_iter() 出发，通过 map 收集成 Vec，成功时保留输入顺序，而不是按任务完成顺序排列
                 // Rayon 负责拆分任务和合并结果
@@ -507,4 +575,21 @@ impl LsmStorageInner {
         let lsm_iter = LsmIterator::new(two_iter, end)?;
         Ok(FusedIterator::new(lsm_iter))
     }
+}
+
+// 返回true，表示区间有所重叠
+fn range_overlap(first: &[u8], last: &[u8], lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
+    let before_lower = match lower {
+        Bound::Included(lower) => last < lower,
+        Bound::Excluded(lower) => last <= lower,
+        Bound::Unbounded => false,
+    };
+
+    let after_upper = match upper {
+        Bound::Included(upper) => first > upper,
+        Bound::Excluded(upper) => first >= upper,
+        Bound::Unbounded => false,
+    };
+
+    !before_lower && !after_upper
 }
