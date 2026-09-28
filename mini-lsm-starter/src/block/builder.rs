@@ -17,10 +17,9 @@
 
 use bytes::BufMut;
 
-use crate::key::{KeySlice, KeyVec};
-
 use super::Block;
-
+use crate::key::{KeySlice, KeyVec};
+use crate::table::encode_shared_prefix;
 /// Builds a block.
 pub struct BlockBuilder {
     /// Offsets of each key-value entries.
@@ -52,10 +51,13 @@ impl BlockBuilder {
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
         // 不应该静默截断
-        let key_len = u16::try_from(key.len()).expect("key 长度超过 u16");
+        // 用前缀格式表示
+        let formatted_key = encode_shared_prefix(key, self.first_key.as_key_slice());
+
+        let formatted_key_len = u16::try_from(formatted_key.len()).expect("key 长度超过 u16");
         let value_len = u16::try_from(value.len()).expect("value 长度超过 u16");
         // 判断是否超过block size
-        let new_size = 2 + key.len() + 2 + value.len() + 2;
+        let new_size = 2 + formatted_key.len() + 2 + value.len() + 2;
         // block 可以因为单个超大 KV 而超过 target size
         if !self.is_empty() && self.get_size() + new_size > self.block_size {
             return false;
@@ -63,8 +65,9 @@ impl BlockBuilder {
         let offset = u16::try_from(self.data.len()).expect("offset超过 u16");
         self.offsets.push(offset);
 
-        self.data.put_u16(key_len);
-        self.data.put_slice(key.raw_ref());
+        self.data.put_u16(formatted_key_len);
+        self.data.put_slice(&formatted_key);
+
         self.data.put_u16(value_len);
         self.data.put_slice(value);
         if self.first_key.is_empty() {
@@ -83,6 +86,7 @@ impl BlockBuilder {
         Block {
             data: self.data,
             offsets: self.offsets,
+            first_key: self.first_key,
         }
     }
 }

@@ -33,6 +33,7 @@ use crate::key::{KeyBytes, KeySlice};
 use crate::lsm_storage::BlockCache;
 
 use self::bloom::Bloom;
+pub use builder::{decode_shared_prefix, encode_shared_prefix};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMeta {
@@ -157,10 +158,20 @@ impl SsTable {
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         // 按需从file中读取block meta offset以及block meta区域的数据
         let len = file.1;
-        let meta_offset_buf = file.read(len - 4, 4)?;
+
+        let bloom_offset_buf = file.read(len - 4, 4)?;
+        let bloom_offset = Bytes::from(bloom_offset_buf).get_u32() as usize;
+
+        let bloom_buf = file.read(bloom_offset as u64, len - 4 - bloom_offset as u64)?;
+        let bloom = Bloom::decode(&bloom_buf)?;
+
+        let meta_offset_buf = file.read(bloom_offset as u64 - 4, 4)?;
         let block_meta_offset = Bytes::from(meta_offset_buf).get_u32() as usize;
 
-        let meta_buf = file.read(block_meta_offset as u64, len - 4 - block_meta_offset as u64)?;
+        let meta_buf = file.read(
+            block_meta_offset as u64,
+            bloom_offset as u64 - 4 - block_meta_offset as u64,
+        )?;
         let block_meta = BlockMeta::decode_block_meta(Bytes::from(meta_buf));
 
         let first_key = block_meta[0].first_key.clone();
@@ -174,7 +185,7 @@ impl SsTable {
             block_cache,
             first_key,
             last_key,
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
         })
     }

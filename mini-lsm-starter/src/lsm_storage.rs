@@ -362,6 +362,16 @@ impl LsmStorageInner {
             if key < sst.first_key().raw_ref() || key > sst.last_key().raw_ref() {
                 continue;
             }
+
+            // 使用bloom filter进行过滤
+            if let Some(bloom) = &sst.bloom {
+                let h = farmhash::fingerprint32(key);
+                // 被filter筛掉了
+                if !bloom.may_contain(h) {
+                    continue;
+                }
+            }
+
             let iter = SsTableIterator::create_and_seek_to_key(
                 Arc::clone(sst),
                 KeySlice::from_slice(key),

@@ -47,6 +47,7 @@ impl<T: AsRef<[u8]>> BitSlice for T {
 }
 
 impl<T: AsMut<[u8]>> BitSliceMut for T {
+    // val表示把第idx个位设置为1还是0
     fn set_bit(&mut self, idx: usize, val: bool) {
         let pos = idx / 8;
         let offset = idx % 8;
@@ -75,8 +76,10 @@ impl Bloom {
         buf.put_u8(self.k);
     }
 
+    // 如果有 entries 个 key，并希望 false positive rate 是 p，每个 key 平均应该分配多少 bit？
     /// Get bloom filter bits per key from entries count and FPR
     pub fn bloom_bits_per_key(entries: usize, false_positive_rate: f64) -> usize {
+        // 总bit数量
         let size = -(entries as f64) * false_positive_rate.ln() / std::f64::consts::LN_2.powi(2);
         let locs = (size / (entries as f64)).ceil();
         locs as usize
@@ -84,16 +87,28 @@ impl Bloom {
 
     /// Build bloom filter from key hashes
     pub fn build_from_key_hashes(keys: &[u32], bits_per_key: usize) -> Self {
+        // 根据公式算出最佳hash数量
         let k = (bits_per_key as f64 * 0.69) as u32;
         let k = k.clamp(1, 30);
+        // 总 bit 数：nbits = key 数 * 每 key bit 数，至少64bit
         let nbits = (keys.len() * bits_per_key).max(64);
         let nbytes = nbits.div_ceil(8);
         let nbits = nbytes * 8;
         let mut filter = BytesMut::with_capacity(nbytes);
+        // 全部初始化为0
         filter.resize(nbytes, 0);
 
         // TODO: build the bloom filter
-
+        for hashed in keys.iter() {
+            let mut h = *hashed;
+            // 步长，一个和hashed key相关的量
+            let delta = h.rotate_left(15);
+            // 进行k次set bit，用双重哈希替代k个哈希函数
+            for _ in 0..k {
+                filter.set_bit(h as usize % nbits, true);
+                h = h.wrapping_add(delta);
+            }
+        }
         Self {
             filter: filter.freeze(),
             k: k as u8,
@@ -108,9 +123,13 @@ impl Bloom {
         } else {
             let nbits = self.filter.bit_len();
             let delta = h.rotate_left(15);
-
-            // TODO: probe the bloom filter
-
+            let mut hashed = h;
+            for _ in 0..self.k {
+                if !self.filter.get_bit(hashed as usize % nbits) {
+                    return false;
+                }
+                hashed = hashed.wrapping_add(delta);
+            }
             true
         }
     }

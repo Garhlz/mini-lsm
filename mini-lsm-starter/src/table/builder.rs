@@ -21,12 +21,12 @@ use std::sync::Arc;
 use super::{BlockMeta, SsTable};
 use crate::{
     block::BlockBuilder,
-    key::{KeyBytes, KeySlice},
+    key::{KeyBytes, KeySlice, KeyVec},
     lsm_storage::BlockCache,
-    table::FileObject,
+    table::{FileObject, bloom::Bloom},
 };
 use anyhow::Result;
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
@@ -36,6 +36,7 @@ pub struct SsTableBuilder {
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    hashed_keys: Vec<u32>,
 }
 
 impl SsTableBuilder {
@@ -48,6 +49,7 @@ impl SsTableBuilder {
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
+            hashed_keys: Vec::new(),
         }
     }
 
@@ -66,6 +68,10 @@ impl SsTableBuilder {
             if self.first_key.is_empty() {
                 self.first_key = new_key;
             }
+
+            // 维护hashed keys
+            let h = farmhash::fingerprint32(key.raw_ref());
+            self.hashed_keys.push(h);
             return;
         }
 
@@ -123,6 +129,9 @@ impl SsTableBuilder {
         // 然后正常编码
         let block_meta_offset = BlockMeta::encode_block_meta(&self.meta, &mut self.data);
 
+        // 在末尾维护bloom filter
+        let bloom = encode_bloom(&self.hashed_keys, &mut self.data);
+
         let file = FileObject::create(path.as_ref(), self.data)?;
 
         Ok(SsTable {
@@ -133,7 +142,7 @@ impl SsTableBuilder {
             block_cache,
             first_key: KeyBytes::from_bytes(self.first_key.into()),
             last_key: KeyBytes::from_bytes(self.last_key.into()),
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
         })
     }
@@ -142,4 +151,43 @@ impl SsTableBuilder {
     pub(crate) fn build_for_test(self, path: impl AsRef<Path>) -> Result<SsTable> {
         self.build(0, None, path)
     }
+}
+
+fn encode_bloom(hashed_keys: &[u32], buf: &mut Vec<u8>) -> Bloom {
+    // 要求误判率为0.01
+    let bits_per_key = Bloom::bloom_bits_per_key(hashed_keys.len(), 0.01);
+    let bloom = Bloom::build_from_key_hashes(hashed_keys, bits_per_key);
+    let bloom_offset = buf.len();
+    bloom.encode(buf);
+    buf.put_u32(bloom_offset as u32);
+    bloom
+}
+
+pub fn encode_shared_prefix(key: KeySlice, first_key: KeySlice) -> Vec<u8> {
+    let prefix_len = key
+        .raw_ref()
+        .iter()
+        .zip(first_key.raw_ref().iter())
+        .take_while(|(x, y)| x == y)
+        .count();
+
+    let rest_len = key.len() - prefix_len;
+
+    let mut buf: Vec<u8> = Vec::new();
+    buf.put_u16(prefix_len as u16);
+    buf.put_u16(rest_len as u16);
+    buf.put_slice(&key.raw_ref()[prefix_len..]);
+    buf
+}
+
+pub fn decode_shared_prefix(mut data: impl Buf, first_key: KeySlice) -> KeyVec {
+    let prefix_len_buf = data.get_u16() as usize;
+    let rest_len = data.get_u16() as usize;
+
+    let mut rest_key = vec![0u8; rest_len];
+    data.copy_to_slice(&mut rest_key);
+
+    let mut prefix_key = first_key.raw_ref()[..prefix_len_buf].to_vec();
+    prefix_key.extend(rest_key);
+    KeyVec::from_vec(prefix_key)
 }

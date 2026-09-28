@@ -17,7 +17,10 @@
 
 mod builder;
 mod iterator;
-use crate::key::{KeySlice, KeyVec};
+use crate::{
+    key::{KeySlice, KeyVec},
+    table::decode_shared_prefix,
+};
 
 pub use builder::BlockBuilder;
 use bytes::{Buf, BufMut, Bytes};
@@ -27,6 +30,7 @@ pub use iterator::BlockIterator;
 pub struct Block {
     pub(crate) data: Vec<u8>,
     pub(crate) offsets: Vec<u16>,
+    first_key: KeyVec,
 }
 
 impl Block {
@@ -59,10 +63,30 @@ impl Block {
         for _ in 0..count {
             offsets.push(offset_buf.get_u16());
         }
+        // 处理空block的边界情况
+        if offsets.is_empty() {
+            return Block {
+                data: vec![],
+                offsets: vec![],
+                first_key: KeyVec::new(),
+            };
+        }
+        let mut offset = offsets[0] as usize;
+
+        let mut key_len_buf = &data[offset..offset + 2];
+        let key_len = key_len_buf.get_u16() as usize;
+
+        offset += 2;
+
+        let encoded_key = &data[offset..offset + key_len];
+
+        // first key和空key比较即可
+        let original_key = decode_shared_prefix(encoded_key, KeySlice::from_slice(&[]));
 
         Block {
             data: block_data,
             offsets,
+            first_key: original_key,
         }
     }
 
@@ -74,9 +98,10 @@ impl Block {
         let key_len = key_len_buf.get_u16() as usize;
 
         offset += 2;
-        let key_buf = self.data[offset..offset + key_len].to_vec();
 
-        KeyVec::from_vec(key_buf)
+        let encoded_key = &self.data[offset..offset + key_len];
+
+        decode_shared_prefix(encoded_key, self.first_key.as_key_slice())
     }
 
     // 获取index位置上的offset对应的键值对的value range
@@ -100,15 +125,16 @@ impl Block {
         let key_len = key_len_buf.get_u16() as usize;
 
         offset += 2;
-        let key_buf = self.data[offset..offset + key_len].to_vec();
-        let key = KeyVec::from_vec(key_buf);
+        let encoded_key = &self.data[offset..offset + key_len];
+
+        let original_key = decode_shared_prefix(encoded_key, self.first_key.as_key_slice());
 
         offset += key_len;
         let mut value_len_buf = &self.data[offset..offset + 2];
         let value_len = value_len_buf.get_u16() as usize;
         offset += 2;
 
-        (key, (offset, offset + value_len))
+        (original_key, (offset, offset + value_len))
     }
 
     // 获取第一个大于等于输入key的kv的offset index
