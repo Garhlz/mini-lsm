@@ -39,6 +39,7 @@ use crate::manifest::Manifest;
 use crate::mem_table::{MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
 use crate::table::{SsTable, SsTableIterator};
+use rayon::prelude::*;
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -464,46 +465,43 @@ impl LsmStorageInner {
 
         let start = map_bound(lower);
         let end = map_bound(upper);
-        let mut sst_iter_vec = Vec::with_capacity(snapshot.sstables.len());
 
-        // 处理sst iters的lower bound问题
-        match start {
-            Bound::Included(start) => {
-                for &index in snapshot.l0_sstables.iter() {
-                    // 按照存储的顺序进行遍历
-                    let sst = snapshot.sstables.get(&index).unwrap();
-                    let iter = SsTableIterator::create_and_seek_to_key(
+        let sst_iter_vec = snapshot
+            .l0_sstables
+            .par_iter()
+            .map(|&id| -> Result<Box<SsTableIterator>> {
+                // 这里从 Vec 的 par_iter() 出发，通过 map 收集成 Vec，成功时保留输入顺序，而不是按任务完成顺序排列
+                // Rayon 负责拆分任务和合并结果
+                let sst = snapshot.sstables.get(&id).unwrap();
+
+                // 根据start的类型创建不同的sst iter
+                let iter = match &start {
+                    Bound::Included(start) => SsTableIterator::create_and_seek_to_key(
                         Arc::clone(sst),
                         KeySlice::from_slice(start.as_ref()),
-                    )?;
-                    sst_iter_vec.push(Box::new(iter));
-                }
-            }
-            Bound::Excluded(start) => {
-                for &index in snapshot.l0_sstables.iter() {
-                    // 按照存储的顺序进行遍历
-                    let sst = snapshot.sstables.get(&index).unwrap();
-                    let start_key = KeySlice::from_slice(start.as_ref());
-                    let mut iter =
-                        SsTableIterator::create_and_seek_to_key(Arc::clone(sst), start_key)?;
-                    if iter.is_valid() && iter.key() == start_key {
-                        iter.next()?;
+                    )?,
+
+                    Bound::Excluded(start) => {
+                        let start_key = KeySlice::from_slice(start.as_ref());
+
+                        let mut iter =
+                            SsTableIterator::create_and_seek_to_key(Arc::clone(sst), start_key)?;
+
+                        if iter.is_valid() && iter.key() == start_key {
+                            iter.next()?;
+                        }
+
+                        iter
                     }
-                    sst_iter_vec.push(Box::new(iter));
-                }
-            }
-            Bound::Unbounded => {
-                for &index in snapshot.l0_sstables.iter() {
-                    // 按照存储的顺序进行遍历
-                    let sst = snapshot.sstables.get(&index).unwrap();
-                    let iter = SsTableIterator::create_and_seek_to_first(Arc::clone(sst))?;
-                    sst_iter_vec.push(Box::new(iter));
-                }
-            }
-        }
+
+                    Bound::Unbounded => SsTableIterator::create_and_seek_to_first(Arc::clone(sst))?,
+                };
+
+                Ok(Box::new(iter))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let sst_merge_iter = MergeIterator::create(sst_iter_vec);
-
         let two_iter = TwoMergeIterator::create(mem_merge_iter, sst_merge_iter)?;
 
         let lsm_iter = LsmIterator::new(two_iter, end)?;
